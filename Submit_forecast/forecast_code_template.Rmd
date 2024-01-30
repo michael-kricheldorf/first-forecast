@@ -10,31 +10,37 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 ```{r load-packages, echo = F, warning=F, message=F}
-## install.packages('remotes')
-## install.packages('fpp3') # package for applying simple forecasting methods
-## install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
-## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
-## install.packages('lubridate') # working with dates and times
-## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+# install.packages('remotes')
+# install.packages('fpp3') # package for applying simple forecasting methods
+# install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
+# install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+# install.packages('lubridate') # working with dates and times
+# remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
 
 # Load packages
 library(tidyverse)
 library(lubridate)
 
+# html to canvas, forecast code to github
+
 ```
 
 ```{r get-targets, message=F}
 #read in the targets data
+#----- This is HISTORICAL data -----
 targets <- read_csv('https://data.ecoforecast.org/neon4cast-targets/aquatics/aquatics-targets.csv.gz')
 
 # read in the sites data
+# ----- This is the METADATA for each site -----
 aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-targets/main/NEON_Field_Site_Metadata_20220412.csv") |>
   dplyr::filter(aquatics == 1)
 
+# ----- Only working with LAKES -----
 lake_sites <- aquatic_sites %>%
   filter(field_site_subtype == 'Lake')
 
 # Filter the targets
+# ----- Filtering by HISTORICAL TEMPERATURE -----
 targets <- targets %>%
   filter(site_id %in% lake_sites$field_site_id,
          variable == 'temperature')
@@ -42,11 +48,25 @@ targets <- targets %>%
 
 ```{r get-NOAA-past, message = F}
 
-# Past stacked weather
+# ----- PAST weather data -----
 noaa_past_s3 <- neon4cast::noaa_stage3()
 
-variables <- c("air_temperature")
-#Other variable names can be found at https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3
+# ----- gathering AIR TEMPERATURE,
+#                 EASTWARD_WIND,
+#             and NORTHWARD_WIND from this past data -----
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
+
+# Other variable names can be found at https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3
+
+# ----- Other variables include: ------
+# air_temperature (K)
+# air_pressure (Pa)
+# relative_humidity (proportion)
+# surface_downwelling_longwave_flux_in_air (W/m^2)
+# surface_downwelling_shortwave_flux_in_air (W/m^2) 
+# precipitation_flux (kg/(m^2 s))
+# eastward_wind (m/s)
+# northward_wind (m/s)
 
 noaa_past <- noaa_past_s3  |> 
   dplyr::filter(site_id %in% lake_sites$field_site_id,
@@ -61,19 +81,25 @@ noaa_past_mean <- noaa_past |>
   summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
   pivot_wider(names_from = variable, values_from = prediction) |> 
   # convert air temp to C
+  mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
   mutate(air_temperature = air_temperature - 273.15)
 
 ```
 
 ```{r get-NOAA-future, message = F}
-# Future weather
+# ----- FUTURE weather forecasts from NOAA -----
 # New forecast only available at 5am UTC the next day
 forecast_date <- Sys.Date() 
+
 noaa_date <- forecast_date - days(1)
 
 noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
-variables <- c("air_temperature")
 
+#----- Add variables here, if needed -----
+
+variables <- c("air_temperature", "eastward_wind", "northward_wind")
+
+#----- Modify this code if added variables -----
 noaa_future <- noaa_future_s3 |> 
   dplyr::filter(datetime >= forecast_date,
                 site_id %in% lake_sites$field_site_id,
@@ -87,8 +113,15 @@ noaa_future_daily <- noaa_future |>
   summarize(prediction = mean(prediction)) |>
   pivot_wider(names_from = variable, values_from = prediction) |>
   # convert to Celsius
+  # ----- If another variable is added, it might need to be modified AND added to the select statement below -----
   mutate(air_temperature = air_temperature - 273.15) |> 
-  select(datetime, site_id, air_temperature, parameter)
+  mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
+  select(datetime, site_id, air_temperature, wind_combined, parameter)
+```
+
+```{r Introduce lag into the model}
+# I was going to continue exploring lag but one-handed typing is so slow and I kinda didn't have time this weekend :/ 
+
 ```
 
 ```{r model-setup}
@@ -138,7 +171,7 @@ for(i in 1:length(lake_sites$field_site_id)) {
 ```{r make-standard}
 # Make forecast fit the EFI standards
 # Remember to change the model_id when you make changes to the model structure!
-my_model_id <- 'example_ID'
+my_model_id <- 'mkricheldorf_example'
 
 temp_lm_forecast_EFI <- temp_lm_forecast %>%
   filter(datetime > forecast_date) %>%
