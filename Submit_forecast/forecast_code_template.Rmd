@@ -54,7 +54,11 @@ noaa_past_s3 <- neon4cast::noaa_stage3()
 # ----- gathering AIR TEMPERATURE,
 #                 EASTWARD_WIND,
 #             and NORTHWARD_WIND from this past data -----
-variables <- c("air_temperature", "eastward_wind", "northward_wind")
+variables <- c("air_temperature"
+               # "eastward_wind", 
+               # "northward_wind", 
+               # "precipitation_flux"
+               )
 
 # Other variable names can be found at https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3
 
@@ -81,7 +85,7 @@ noaa_past_mean <- noaa_past |>
   summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
   pivot_wider(names_from = variable, values_from = prediction) |> 
   # convert air temp to C
-  mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
+  #mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
   mutate(air_temperature = air_temperature - 273.15)
 
 ```
@@ -97,7 +101,11 @@ noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
 
 #----- Add variables here, if needed -----
 
-variables <- c("air_temperature", "eastward_wind", "northward_wind")
+variables <- c("air_temperature"
+               # "eastward_wind", 
+               # "northward_wind", 
+               # "precipitation_flux"
+               )
 
 #----- Modify this code if added variables -----
 noaa_future <- noaa_future_s3 |> 
@@ -115,13 +123,13 @@ noaa_future_daily <- noaa_future |>
   # convert to Celsius
   # ----- If another variable is added, it might need to be modified AND added to the select statement below -----
   mutate(air_temperature = air_temperature - 273.15) |> 
-  mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
-  select(datetime, site_id, air_temperature, wind_combined, parameter)
-```
-
-```{r Introduce lag into the model}
-# I was going to continue exploring lag but one-handed typing is so slow and I kinda didn't have time this weekend :/ 
-
+  #mutate(wind_combined = (eastward_wind**2 + northward_wind**2)**(1/2)) |>
+  select(datetime, 
+         site_id, 
+         air_temperature, 
+         # wind_combined, 
+         # precipitation_flux, 
+         parameter)
 ```
 
 ```{r model-setup}
@@ -137,35 +145,215 @@ temp_lm_forecast <- NULL
 
 ```
 
+```{r Introduce lag into the model}
+
+# ----- 1-DAY WATER TEMPERATURE LAG -----
+# 
+# water_lag_days = 1
+# 
+# # modify targets_lm for training/fitting the model
+# targets_lm <- targets_lm %>%
+#   mutate(temp_yday = lag(temperature, water_lag_days))
+# 
+# # modify future forecast dataset for testing/forecasting the model
+# 
+# # create blank column of water temperature lagged
+# # noaa_future_daily <- noaa_future_daily |>
+# #   mutate(water_temp_lag = NA)
+# 
+# noaa_temp_yday <- noaa_future_daily |>
+#   full_join(targets_lm, by=c("datetime", "site_id")) |>
+#   select(datetime, site_id, parameter, temp_yday)
+  #filter(datetime >= (forecast_date - water_lag_days))
+
+# create vector of date range between today's date (according to NOAA
+#   and t_he maximum NOAA forecast date)
+
+# noaa_date_range <- data.frame(datetime = NA, site_id = NA, temp_yday = NA)
+# 
+# 
+# 
+# for (i in 1:length(unique(targets_lm$site_id)))
+# {
+#   
+#   noaa_date_range <- noaa_date_range |>
+#     rbind(data.frame(
+#       datetime = seq(min(as.Date(noaa_future_daily$datetime)) - water_lag_days, 
+#                        max(as.Date(noaa_future_daily$datetime)) - water_lag_days, 
+#                        by="days")))
+# }
+# 
+# noaa_date_range <- noaa_date_range |>
+#   mutate(temp_yday = ifelse(datetime == targets_lm$datetime ,targets_lm$temp_yday, NA))
+
+# since this is an initial condition, it's worth including uncertainty here
+
+
+# # loop thru dates in vector until current day is reached
+# for (day in 1:water_lag_days)
+# {
+#   noaa_future_daily <- noaa_future_daily |>
+#     mutate(water_temp_lag = ifelse())
+# }
+
+# # current_day = t = 0
+# 
+# # lagging to air temperature lag_days ago (3)
+# 
+# # for ( current day to last day of forecast ):
+#   curr_day = t - lag_days
+#   if (curr_day < 0)
+#   {
+#     air_lag for t = past_days(curr_day)
+#   } 
+#   else 
+#   {
+#     air_lag for t = NOAA_forecast(curr_day)
+#   }
+
+# ----- N-DAY AIR TEMPERATURE LAG -----
+
+# air_lag_days = 3
+# 
+# # modify targets_lm for training/fitting the model
+# targets_lm <- targets_lm %>%
+#   mutate(air_temp_nday = lag(air_temperature, air_lag_days))
+
+# modify future forecast dataset for testing/forecasting the model
+  # use below if-logic structure
+
+# make empty dataframe for lagged days
+
+# NOTE NOAA air temp day is already 1 day ahead of forecast day
+# 
+# # current_day = t = 0
+# 
+# # lagging to air temperature lag_days ago (3)
+# 
+# # for ( current day to last day of forecast ):
+#   curr_day = t - lag_days
+#   if (curr_day < 0)
+#   {
+#     air_lag for t = past_days(curr_day)
+#   } 
+#   else 
+#   {
+#     air_lag for t = NOAA_forecast(curr_day)
+#   }
+
+#TODO: when we reach 'assess forecasts', make lag iterative to determine what will yield the most accurate forecast
+
+```
+
 ```{r forecast-loop}
+
 for(i in 1:length(lake_sites$field_site_id)) {  
+  
+  water_lag_days = 1
   
   example_site <- lake_sites$field_site_id[i]
   
   site_target <- targets_lm |>
-    filter(site_id == example_site)
+    filter(site_id == example_site) |>
+    mutate(yday_temp = lag(temperature, water_lag_days))
 
   noaa_future_site <- noaa_future_daily |> 
     filter(site_id == example_site)
   
-  #Fit linear model based on past data: water temperature = m * air temperature + b
-  fit <- lm(site_target$temperature ~ site_target$air_temperature)
-  # fit <- lm(site_target$temperature ~ ....)
-    
-  # use linear regression to forecast water temperature for each ensemble member
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
-    
-  # put all the relavent information into a tibble that we can bind together
-  temperature <- tibble(datetime = noaa_future_site$datetime,
-                        site_id = example_site,
-                        parameter = noaa_future_site$parameter,
-                        prediction = forecasted_temperature,
-                        variable = "temperature")
+  # this yields a df starting at the first NOAA air temp obs
+  past_dates_df <- data.frame(datetime = seq(min(site_target$datetime) - water_lag_days, 
+                        max(site_target$datetime) - water_lag_days, by="days"))
   
-  temp_lm_forecast <- dplyr::bind_rows(temp_lm_forecast, temperature)
-  message(example_site, ' temperature forecast run')
+  site_target <- site_target |>
+    right_join(past_dates_df, by = c("datetime"))
+  
+  site_target <-
+    site_target[which(!is.na(site_target$air_temperature), arr.ind = TRUE), ]
+  
+  site_target <-
+    site_target[order(site_target$datetime, decreasing = TRUE), ]
+  
+  site_target <-
+    site_target[which(!is.na(site_target$temperature), arr.ind = TRUE), ]
+    
+    
+    # fit model on range of min_date(noaa_past_daily):(most recent day of obs that is NA)-1 dates of data, 
+    # 
+    
+    # then use a loop to forecast water temp from 
+    # (most recent day of obs that is NA) to present (t = 0)
+    # using noaa_past_daily as driver data instead of NOAA forecast ensembles
+    # and water_temperature @ t uses the water temperature forecasted from (t - 1)
+    
+    # calculate the uncertainty, which is then used as initial condition uncertainty
+    # for the next step
+    
+    # at this point, water temperature should have a value at t = 0 (present day)
+    # fit a second model using t = 0 water temperature from the next day (t = 1)
+    # to the forecast horizon
+    # and water_temperature @ t uses the water temperature forecasted from (t - 1)
+  
+  # Updated equation to represent relationship:
+  #      w_temp_t+1 = b_1 
+  #                 + (b_4*w_temp_yday) 
+  #                 + (b_5*air_temp) 
+  #                 + W
+  #####                 + (b_2*wind_c) 
+  #####                 + (b_3*precip)
+  #
+  # where W = rnorm(n = 30, mean = 0, sd = sigma)
+  #       and b_1 -> b_5 are coefficients selected from a 
+  #       standard distribution for each parameter
+  
+  # ----- FITTING THE MODEL -----
+  
+  # fit <- lm( site_target$temperature 
+  #           ~ site_target$temp_yday
+  #           + site_target$air_temperature
+  #           )
+  
+  # ----- CALCULATING UNCERTAINTIES -----
+  
+  # initial condition uncertainty
+  
+  
+  # parameter uncertainty
+  
+  # driver uncertainty
+  
+  # process uncertainty
+  
+  # ----- FORECASTING WITH QUANTIFIED UNCERTAINTY -----
+  
+  # use linear regression to forecast water temperature for each ensemble member
+  # forecasted_temperature <- fit$coefficients[1] 
+  #   + fit$coefficients[2] * noaa_future_site$wind_combined
+  #   + fit$coefficients[3] * noaa_future_site$precipitation_flux
+  #   + fit$coefficients[4] * noaa_future_site$temp_yday
+  #   + rnorm(n = 30, mean = 0, sd = sigma)
+  # # put all the relavent information into a tibble that we can bind together
+  # temperature <- tibble(datetime = noaa_future_site$datetime,
+  #                       site_id = example_site,
+  #                       parameter = noaa_future_site$parameter,
+  #                       prediction = forecasted_temperature,
+  #                       variable = "temperature")
+  # 
+  # temp_lm_forecast <- dplyr::bind_rows(temp_lm_forecast, temperature)
+  # message(example_site, ' temperature forecast run')
   
 }
+```
+
+```{r quantify-uncertainty}
+
+# initial condition uncertainty -- prerequisite: forecast needs to have lag added in
+
+
+# build parameter standard distribution dataframe
+
+# parameter uncertainty, driver uncertainty, process uncertainty
+# for (i in 2:length())
+
 ```
 
 ```{r make-standard}
@@ -202,14 +390,13 @@ neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
 
 ```
 
-
 ```{r submit-forecast}
 
 ## # can uses the neon4cast::forecast_output_validator() to check the forecast is in the right format
 
 # UNCOMMMENT THIS WHEN YOU ARE READY TO SUBMIT
-## neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1),
-##                   ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
+# neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1),
+#                   ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
 
 
 ```

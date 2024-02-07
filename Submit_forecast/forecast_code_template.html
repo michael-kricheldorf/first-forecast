@@ -524,8 +524,23 @@ neon4cast::forecast_output_validator(file.path(&#39;Forecasts&#39;,forecast_file
 <pre class="r"><code>## # can uses the neon4cast::forecast_output_validator() to check the forecast is in the right format
 
 # UNCOMMMENT THIS WHEN YOU ARE READY TO SUBMIT
-## neon4cast::submit(forecast_file = file.path(&#39;Forecasts&#39;, forecast_file_1),
-##                   ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit</code></pre>
+neon4cast::submit(forecast_file = file.path(&#39;Forecasts&#39;, forecast_file_1),
+                  ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit</code></pre>
+<pre><code>## validating that file matches required standard</code></pre>
+<pre><code>## Forecasts/aquatics-2024-01-30-mkricheldorf_example.csv</code></pre>
+<pre><code>## ✔ file has model_id column
+## ✔ forecasted variables found correct variable + prediction column
+## ✔ file has correct family and parameter columns
+## ✔ file has site_id column
+## ✔ file has datetime column
+## ✔ file has correct datetime column</code></pre>
+<pre><code>## Warning: file missing duration column (values for the column: daily = P1D,
+## 30min = PT30M)</code></pre>
+<pre><code>## Warning: file missing project_id column (use `neon4cast` as the project_id</code></pre>
+<pre><code>## ✔ file has reference_datetime column
+## Forecast format is valid
+## 
+## Thank you for submitting!</code></pre>
 <pre class="r"><code>temp_lm_forecast_EFI |&gt; 
   ggplot(aes(x=datetime, y=prediction, group = parameter)) +
   geom_line() +
