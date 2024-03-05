@@ -17,7 +17,9 @@ knitr::opts_chunk$set(echo = TRUE)
 ## install.packages('lubridate') # working with dates and times
 ## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
 
-# Load packages`
+install.packages('tidymodels')
+
+# Load packages
 library(tidyverse)
 library(lubridate)
 library(tidymodels)
