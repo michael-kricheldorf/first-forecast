@@ -235,7 +235,7 @@ Remember to change the model_id when you make changes to the model structure!
 
 ```{r}
 my_project_id <- "neon4cast"
-my_model_id <- 'mkricheldorf_w_uncertainty'
+my_model_id <- 'mkricheldorf_w_lag'
 
 ```
 
