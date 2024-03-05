@@ -105,11 +105,11 @@ forecast_df <- NULL
 
 ```
 
-```{r forecast-loop, message=FALSE}
+```{r forecast-loops}
 forecast_horizon <- 30
 forecast_dates <- seq(from = ymd(forecast_date), to = ymd(forecast_date) + forecast_horizon, by = "day")
 n_members <- 31
-
+forecast_df <- NULL
 
 for(i in 1:length(lake_sites$field_site_id)) {  
   
@@ -117,7 +117,8 @@ for(i in 1:length(lake_sites$field_site_id)) {
   
   # Get only the necessary data for the specific site
   site_target <- targets_lm |>
-    filter(site_id == curr_site)
+    filter(site_id == curr_site) |> 
+    na.omit()
 
   noaa_future_site <- noaa_future_daily |> 
     filter(site_id == curr_site)
@@ -133,7 +134,7 @@ for(i in 1:length(lake_sites$field_site_id)) {
   fit_summary <- summary(fit)
   params_se <- fit_summary$coefficients[,2]
   mod <- predict(fit, data = site_target)
-  mod <- c(NA, mod)
+  # mod <- c(NA, mod)
   r2 <- round(fit_summary$r.squared, 2) 
   residuals <- mod - site_target$temperature
   err <- mean(residuals, na.rm = TRUE) 
@@ -147,28 +148,28 @@ for(i in 1:length(lake_sites$field_site_id)) {
   
   # Loop through all forecast dates
   for (t in 1:length(forecast_dates)) {
-  
-  #pull driver ensemble for the relevant date; here we are using all 30 NOAA ensemble members
-  site_drivers <- noaa_future_site %>%
-    filter(datetime == forecast_dates[t])
-  
-  # use linear regression to forecast water temperature for each ensemble member
-  # You will need to modify this line of code if you add additional weather variables or change the form of the model
-  # The model here needs to match the model used in the lm function above (or what model you used in the fit)
-  forecasted_temperature <- param_df$beta1 + param_df$beta2 * site_drivers$air_temperature
-                                           + param_df$beta3 * site_drivers$precipitation_flux
-                                           + param_df$beta4 * site_drivers$eastward_wind
-                                           + param_df$beta5 * site_drivers$northward_wind
-                                           + rnorm(n = forecast_horizon, mean = 0, sd = sigma)
     
-  # put all the relevant information into a tibble that we can bind together
-  curr_site_df <- tibble(datetime = rep(forecast_dates[t], times = n_members),
-                         site_id = curr_site,
-                         parameter = 1:n_members,
-                         prediction = forecasted_temperature,
-                         variable = "temperature") #Change this if you are forecasting a different variable
-  
-  forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
+    #pull driver ensemble for the relevant date; here we are using all 30 NOAA ensemble members
+    site_drivers <- noaa_future_site %>%
+      filter(datetime == forecast_dates[t])
+    
+    # use linear regression to forecast water temperature for each ensemble member
+    # You will need to modify this line of code if you add additional weather variables or change the form of the model
+    # The model here needs to match the model used in the lm function above (or what model you used in the fit)
+    forecasted_temperature <- param_df$beta1 + param_df$beta2 * site_drivers$air_temperature
+                                             + param_df$beta3 * site_drivers$precipitation_flux
+                                             + param_df$beta4 * site_drivers$eastward_wind
+                                             + param_df$beta5 * site_drivers$northward_wind
+                                             + rnorm(n = forecast_horizon, mean = 0, sd = sigma)
+      
+    # put all the relevant information into a tibble that we can bind together
+    curr_site_df <- tibble(datetime = rep(forecast_dates[t], times = n_members),
+                           site_id = curr_site,
+                           parameter = 1:n_members,
+                           prediction = forecasted_temperature,
+                           variable = "temperature") #Change this if you are forecasting a different variable
+    
+    forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
   
   }
   

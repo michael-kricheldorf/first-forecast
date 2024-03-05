@@ -1,0 +1,515 @@
+---
+title: "NEON forecast challenge submission"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load-packages, echo = F, warning=F, message=F}
+## install.packages('remotes')
+## install.packages('fpp3') # package for applying simple forecasting methods
+## install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
+## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+## install.packages('lubridate') # working with dates and times
+## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+
+# Load packages`
+library(xgboost)
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+```
+
+This is where you could change or add meteorological variables that are used to predict the target
+
+Other variable names can be found at <https://projects.ecoforecast.org/neon4cast-docs/Shared-Forecast-Drivers.html#stage-3>
+
+```{r}
+
+driver_variables <- c("air_temperature")
+forecast_variable = "temperature"
+```
+
+```{r get-targets, message=F}
+#read in the targets data
+targets <- read_csv('https://data.ecoforecast.org/neon4cast-targets/aquatics/aquatics-targets.csv.gz')
+
+# read in the sites data
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-targets/main/NEON_Field_Site_Metadata_20220412.csv") |>
+  dplyr::filter(aquatics == 1)
+
+lake_sites <- aquatic_sites %>%
+  filter(field_site_subtype == 'Lake')
+
+# Filter the targets
+targets <- targets %>%
+  filter(site_id %in% lake_sites$field_site_id,
+         variable == forecast_variable)
+```
+
+```{r get-NOAA-past, message = F}
+
+# Past stacked weather
+noaa_past_s3 <- neon4cast::noaa_stage3()
+
+noaa_past <- noaa_past_s3  |> 
+  dplyr::filter(site_id %in% lake_sites$field_site_id,
+                datetime >= ymd('2017-01-01'),
+                variable %in% driver_variables) |> 
+  dplyr::collect()
+
+# aggregate the past to mean values
+noaa_past_mean <- noaa_past |>
+  mutate(datetime = as_date(datetime)) |>
+  group_by(datetime, site_id, parameter, variable) |>
+  summarize(prediction = mean(prediction), .groups = "drop") |>
+  mutate(prediction = ifelse(variable == driver_variables, prediction - 273.15, prediction)) |>
+  pivot_wider(names_from = variable, values_from = prediction) |>
+  select(any_of(c('datetime', 'site_id', driver_variables, 'parameter')))
+```
+
+```{r get-NOAA-future, message = F}
+# Future weather
+# New forecast only available at 5am UTC the next day
+forecast_date <- Sys.Date() 
+noaa_date <- forecast_date - days(1)
+
+noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+
+noaa_future <- noaa_future_s3 |> 
+  dplyr::filter(datetime >= forecast_date,
+                site_id %in% lake_sites$field_site_id,
+                variable %in% driver_variables) |> 
+  collect()
+
+noaa_future_mean <- noaa_future |>
+  mutate(datetime = as_date(datetime)) |>
+  group_by(datetime, site_id, parameter, variable) |>
+  summarize(prediction = mean(prediction), .groups = "drop") |>
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |>
+  pivot_wider(names_from = variable, values_from = prediction) |>
+  select(any_of(c('datetime', 'site_id', driver_variables, 'parameter')))
+```
+
+```{r model-setup, message = FALSE}
+# Generate a dataframe to fit the model from 
+targets_lm <- targets |> 
+  pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+  left_join(noaa_past_mean, 
+            by = c("datetime","site_id"))
+```
+
+```{r forecast-loops}
+forecast_horizon <- 30
+n_members <- 31
+
+lag_days = 1
+
+tidymodels_forecast <- data.frame()
+
+# ----- MAIN LOOP -----
+
+for(i in 1:length(lake_sites$field_site_id)) {  
+  # ----- GENERATE AND SPLIT DATASETS -----
+  
+  site = lake_sites$field_site_id[i]
+  
+  # gathers the last day of an observation for each site and how many days out
+  # the forecast horizon must go out to
+  forecast_start_by_site <- targets |>
+      mutate(temperature_lag = lag(observation, lag_days)) |> # account for lag
+      dplyr::filter(!is.na(observation) & site_id == site & variable == forecast_variable) |>
+      # Start the day after the most recent non-NA value
+      dplyr::summarise(start_date = max(datetime)) |>  # Date
+      dplyr::mutate(h = (Sys.Date() - start_date) + forecast_horizon,
+                    h = as.numeric(h)) |>  # Horizon value
+      dplyr::ungroup()
+
+  # this is 1 day after the last date of observation
+  forecast_start_date = forecast_start_by_site[[1]]
+  # this is the number of days between the start date and today + forecast horizon
+  horizon_days = forecast_start_by_site[[2]]
+  
+  # combine past and future data by site
+  noaa_past_site <- noaa_past_mean |>
+      dplyr::filter(datetime <= noaa_date,
+                  site_id %in% site)
+  
+  noaa_future_site <- noaa_future_mean |>
+      dplyr::filter(datetime > noaa_date,
+                    site_id %in% site)
+  
+  combined_noaa_site <- bind_rows(noaa_past_site, noaa_future_site)
+
+  # generate a data frame to fit the model on
+  targets_site <- targets |>
+      dplyr::filter(site_id == site,
+                    datetime >= min(combined_noaa_site$datetime)) |>
+      pivot_wider(names_from = 'variable', values_from = 'observation') |>
+      full_join(combined_noaa_site, by = c("datetime","site_id")) |> 
+      group_by(parameter) |>
+      mutate(temperature_lag = lag(temperature, lag_days)) |>
+      ungroup() |>
+      mutate(doy = yday(datetime))
+  
+  # now extract data from 2017-01-01 to date of last observation
+  past_to_last_obs <- targets_site |>
+    dplyr::filter(datetime < forecast_start_date) |>
+    filter(!is.na(temperature_lag))
+  
+  # extract data from date of last obs + 1 out to forecast horizon
+  last_obs_to_horizon <- targets_site |>
+    dplyr::filter(datetime >= forecast_start_date)
+  
+  # ----- Apply Model to Training and Testing Data -----
+  
+  # split past_to_last_obs for testing and training
+  split <- initial_split(past_to_last_obs, prop = 0.80, strata = site_id)
+  train_data <- training(split) |>
+    dplyr::filter(parameter == 1) |>
+    select(-parameter)
+  
+  test_data <- testing(split) |>
+      dplyr::filter(parameter == 1) |>
+      select(-parameter)
+    
+  #Fit linear model based on past data: water temperature = m * air temperature + b
+  #you will need to change the variable on the left side of the ~ if you are forecasting oxygen or chla
+  fit <- lm(train_data$temperature ~ train_data$air_temperature + train_data$temperature_lag)
+  
+  # calculate how well the model fit
+  fit_summary <- summary(fit)
+  params_se <- fit_summary$coefficients[,2]
+  
+  mod <- predict(fit, new_data = test_data)
+  
+  # mod <- c(NA, mod)
+  r2 <- round(fit_summary$r.squared, 2) 
+  residuals <- mod - test_data$temperature
+  err <- mean(residuals, na.rm = TRUE) 
+  rmse <- round(sqrt(mean((residuals)^2, na.rm = TRUE)), 2) 
+  sigma <- sd(residuals, na.rm = TRUE)
+  param_df <- data.frame(beta1 = rnorm(n_members, fit$coefficient[1], params_se[1]),
+                       beta2 = rnorm(n_members, fit$coefficient[2], params_se[2]),
+                       beta3 = rnorm(n_members, fit$coefficient[3], params_se[3]))
+  
+  # # training/testing data should have water temp available so we make
+  # # a "special" set with NA water temp values removed
+  # # generate recipe of our data
+  # recipe <- train_data |>
+  #     recipe(temperature ~ air_temperature + temperature_lag + doy) |>
+  #     step_naomit(air_temperature, temperature, temperature_lag)
+  # 
+  # # set the model and engine
+  # model <- linear_reg(
+  #     mode = "regression",
+  #     engine = "lm")
+  # 
+  # # combine model, engine, and recipe as a workflow
+  # wflow <- workflow() |>
+  #     add_model(model) |>
+  #     add_recipe(recipe)
+  # 
+  # 
+  # # fit workflow on the training data
+  # fit <- wflow |>
+  #     fit(data = train_data)
+  # 
+  # # calculate how well the model fit
+  # fit_summary <- tidy(fit)
+  # params_coeff <- fit_summary$estimate
+  # params_se <- fit_summary$std.error
+  # 
+  # 
+  # #mod <- predict(fit, data = site_target)
+  # # mod <- c(NA, mod)
+  # 
+  # # predict testing data
+  # predictions <- predict(fit, new_data = test_data)
+  # 
+  # # merge the predicted values with its associated testing data
+  # pred_test <- bind_cols(test_data, predictions)
+  # 
+  # #r2 <- round(fit_summary$r.squared, 2) 
+  # # calculate r^2 and RMSE values
+  # multi_metric <- metric_set(rmse, rsq)
+  # 
+  # metric_table <- pred_test |>
+  #   multi_metric(truth = temperature, estimate = .pred)
+  # 
+  # my_rmse <- metric_table$.estimate[1]
+  # my_rsq <- metric_table$.estimate[2]
+  # 
+  # residuals <- pred_test$.pred - test_data$temperature
+  # err <- mean(residuals, na.rm = TRUE) 
+  # sigma <- sd(residuals, na.rm = TRUE)
+  # param_df <- data.frame(beta1 = rnorm(n_members, params_coeff[1], params_se[1]),
+  #                      beta2 = rnorm(n_members, params_coeff[2], params_se[2]),
+  #                      beta3 = rnorm(n_members, params_coeff[3], params_se[3]),
+  #                      beta4 = rnorm(n_members, params_coeff[4], params_se[4]),
+  #                      p_unc = rnorm(n = n_members, mean = 0, sd = sigma))
+
+  # ----- Apply Model to "Future" Data -----
+  
+  # this needs to be done iteratively through both 
+    # ensemble member AND
+    # date/time
+  # because the all of the temperature column is NA and must be calculated
+  # using the previous day's water temperature first
+  # if parameter is ignored, then the driver uncertainty would be ignored and 
+  # the same value would be applied for each parameter. which is deterministic.
+  
+  # sorry in advance for the cursed double nested loop
+  
+  targets_future <- last_obs_to_horizon |>
+    mutate(prediction = NA,
+            doy = yday(datetime),
+            parameter = parameter + 1,
+            datetime = as_datetime(datetime))
+  
+  # loop through each day
+  for (t in unique(targets_future$datetime))
+  {
+    curr_date <- t
+      
+    targets_by_day <- targets_future |>
+      dplyr::filter(datetime == curr_date)
+    
+    if (curr_date != min(targets_future$datetime))
+    {
+      targets_by_day <- targets_by_day |>
+        mutate(temperature_lag = targets_yday$prediction)
+    }
+    
+    # loop through each ensemble to see if previous date/ens 
+    # has a temperature obs or prediction to use for lag temp
+    for (ens in targets_by_day$parameter)
+    {
+      targets_by_day_ens <- targets_by_day |>
+        dplyr::filter(parameter == ens)
+      
+      day_ens_pred <- predict(fit, new_data = targets_by_day_ens)
+      
+      targets_by_day_ens <- targets_by_day_ens |>
+        mutate(prediction = day_ens_pred)
+      
+      # # if this individual date/ens has a NULL lagged temperature,
+      # # then set it equal to the previous day's same-ensemble number's 
+      # # observed temperature is null, then set it equal to the predicted temp
+      # if (is.na(targets_by_day_ens$temperature_lag))
+      # {
+      #   # slow and clunky to refer to a variable that has already been iterated over,
+      #   # but my critical thinking skills are at rock bottom right now
+      #   targets_yday_ens <- targets_future |>
+      #     dplyr::filter(parameter == ens) |>
+      #     dplyr::filter(datetime == (curr_date - lubridate::days(1)))
+      #   
+      #   if (!is.na(targets_yday_ens$prediction))
+      #   {
+      #     targets_by_day_ens <- targets_by_day_ens |>
+      #       mutate(temperature_lag = targets_yday_ens$prediction)
+      #   }
+      #   else if (!is.na(targets_yday_ens$temperature))
+      #   {
+      #     targets_by_day_ens <- targets_by_day_ens |>
+      #       mutate(temperature_lag = targets_yday_ens$temperature)
+      #   }
+      # } # close if conditional
+      
+            ## RIGHT HERE MUTATE PRED INTO
+      
+                # now estimate the next day's temp for all 31 ensembles
+      
+      # targets_by_day_ens <- targets_by_day_ens |>
+      #       mutate(prediction = day_pred[ens])
+      
+      # # now estimate the next day's ensemble temp
+      # new_pred <- param_df$beta1
+      #           + param_df$beta2 * curr_day$air_temperature
+      #           + param_df$beta3 * curr_day$temperature_lag
+      #           + param_df$beta4 * curr_day$doy
+      #           + rnorm(n = n_members, mean = 0, sd = sigma)
+      
+      
+      #tidymodels_forecast <- bind_rows(tidymodels_forecast, targets_by_day_ens)
+    }
+    
+    tidymodels_forecast <- bind_rows(tidymodels_forecast, targets_by_day)
+    
+    
+    # keep yesterday's for another iteration
+    targets_yday <- targets_by_day
+  }
+  
+  
+  # targets_future <- last_obs_to_horizon |> 
+  # mutate(temperature = NA,
+  #        doy = yday(datetime))
+  # 
+  # temperature_lag_val = NA
+  # 
+  # for (t in unique(targets_future$datetime)) {
+  #    
+  #   # get the current day at that given ensemble member
+  #   curr_day <- targets_future |>
+  #     dplyr::filter(datetime == t)
+  # 
+  #   # if temperature_lag is NA (it should be for all except the first row), then
+  #   # set it equal to the previous day's predicted value
+  #   if (is.na(curr_day$temperature_lag[1]))
+  #   {
+  #     curr_day <- curr_day |>
+  #       mutate(temperature_lag = as.double(temperature_lag_val))
+  #   }    
+  # 
+  #   forecasted_temperature <- param_df$beta1
+  #                           + param_df$beta2 * curr_day$air_temperature
+  #                           + param_df$beta3 * curr_day$temperature_lag
+  #                           + param_df$beta4 * curr_day$doy
+  #                           + rnorm(n = n_members, mean = 0, sd = sigma)
+  #   
+  #   curr_day <- curr_day |>
+  #     mutate(parameter = parameter + 1,
+  #            prediction = forecasted_temperature)
+  #   
+  #   temperature_lag_val <- forecasted_temperature
+  #   
+  #   tidymodels_forecast <- bind_rows(tidymodels_forecast, curr_day)
+  # 
+  # }
+    
+  #   for(e in unique(curr_day$parameter)){
+  #     
+  #     # get the current ensemble member we are calculating lag/forecasting for
+  #     ens_mem <- curr_day |>
+  #       dplyr::filter(parameter == e) |>
+  #       select(-parameter)
+  #     
+  #     new_pred <- predict(fit, new_data = ens_mem)
+  #     # # forecast the current day's temperature using the prev day's temp
+  #     # forecasted_temperature <- param_df$beta1[e+1]
+  #     #                           + param_df$beta2[e+1] * ens_mem$air_temperature
+  #     #                           + param_df$beta3[e+1] * ens_mem$temperature_lag
+  #     #                           + param_df$beta4[e+1] * ens_mem$doy
+  #     #                           + rnorm(n = n_members, mean = 0, sd = sigma)[e+1]
+  # 
+  #     temperature_lag_val <- new_pred
+  #     
+  #     ens_mem <- ens_mem |> 
+  #       mutate(parameter = e,
+  #              .pred = new_pred)
+  #     
+  #     tidymodels_forecast <- bind_rows(tidymodels_forecast, ens_mem)
+  #   }
+  # }
+  
+  
+  # # loop through each ensemble member of "future" data
+  # for(e in unique(targets_future$parameter)){
+  #   
+  #   # get the current ensemble member we are calculating lag/forecasting for
+  #   ens_mem <- targets_future |>
+  #     dplyr::filter(parameter == e) |>
+  #       select(-parameter)
+  # 
+  #   # loop through each day within that ensemble member
+  #   for (t in unique(ens_mem$datetime)) {
+  #     
+  #     # get the current day at that given ensemble member
+  #     curr_day_ens_mem <- ens_mem |>
+  #       dplyr::filter(datetime == t)
+  #     
+  #     # if temperature_lag is NA (it should be for all except the first row), then
+  #     # set it equal to the previous day's predicted value
+  #     if (is.na(curr_day_ens_mem$temperature_lag))
+  #     {
+  #       curr_day_ens_mem <- curr_day_ens_mem |>
+  #         mutate(temperature_lag = as.double(temperature_lag_val))
+  #     }
+  #     
+  #     # new_pred <- predict(fit, new_data = curr_day_ens_mem)
+  #     # forecast the current day's temperature using the prev day's temp
+  #     forecasted_temperature <- param_df$beta1[e+1]
+  #                               + param_df$beta2[e+1] * curr_day_ens_mem$air_temperature
+  #                               + param_df$beta3[e+1] * curr_day_ens_mem$temperature_lag
+  #                               + param_df$beta4[e+1] * curr_day_ens_mem$doy
+  #                               + rnorm(n = 30, mean = 0, sd = sigma)[e+1]
+  #     
+  #     temperature_lag_val <- forecasted_temperature
+  #     
+  #     forecast_curr_day_ens_mem <- bind_cols(curr_day_ens_mem, forecasted_temperature) |> 
+  #       mutate(parameter = e)
+  #     
+  #     tidymodels_forecast <- bind_rows(tidymodels_forecast, forecast_curr_day_ens_mem)
+  #   }
+  # }
+  message(site, ' forecast run')
+}
+```
+
+Remember to change the model_id when you make changes to the model structure!
+
+```{r}
+my_project_id <- "neon4cast"
+my_model_id <- 'example_mkricheldorf_w_uncertainty'
+
+```
+
+```{r make-standard}
+# Make forecast fit the EFI standards
+tidymodels_forecasts_EFI <- tidymodels_forecast %>%
+  mutate(variable = "temperature") |> 
+  rename(prediction = .pred) |>
+  # For the EFI challenge we only want the forecast for future
+  filter(datetime > Sys.Date()) %>%
+  group_by(site_id, variable) %>%
+  mutate(reference_datetime = min(datetime) - lubridate::days(1),
+         family = "ensemble",
+         model_id = my_model_id,
+         reference_datetime = forecast_date,
+         project_id = 'neon4cast',
+         duration = 'P1D') %>%
+  select(datetime, reference_datetime, site_id, family, parameter, variable, prediction, model_id, project_id, duration)
+
+```
+
+```{r write-forecast}
+# Write the forecast to file
+theme <- 'aquatics'
+forecast_name_1 <- paste0(tidymodels_forecasts_EFI$model_id[1], ".csv")
+forecast_file_1 <- paste(theme, forecast_date, forecast_name_1, sep = '-')
+forecast_file_1
+
+
+if (!dir.exists('Forecasts')) {
+  dir.create('Forecasts')
+}
+
+write_csv(tidymodels_forecasts_EFI, file.path('Forecasts',forecast_file_1))
+```
+
+Check that forecast format is valid
+
+```{r}
+neon4cast::forecast_output_validator(file.path('Forecasts',forecast_file_1))
+```
+
+Change eval = TRUE if you want to submit
+
+```{r submit-forecast, eval= TRUE}
+
+neon4cast::submit(forecast_file = file.path('Forecasts', forecast_file_1), ask = TRUE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
+
+```
+
+```{r plot-forecast}
+tidymodels_forecasts_EFI |> 
+  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+  geom_line() +
+  facet_wrap(~site_id) +
+  labs(title = paste0('Forecast generated for ', tidymodels_forecasts_EFI$variable[1], ' on ', tidymodels_forecasts_EFI$reference_datetime[1]))
+```
